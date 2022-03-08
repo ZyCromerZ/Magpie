@@ -23,18 +23,15 @@ public:
 
 	bool Initialize() override;
 
-	ComPtr<ID3D11Texture2D> GetOutput() override {
-		return _output;
-	}
-
 	UpdateState Update() override;
-
-	bool HasRoundCornerInWin11() override {
-		return true;
-	}
 
 	bool IsScreenCapture() override {
 		return _isScreenCapture;
+	}
+
+protected:
+	bool _HasRoundCornerInWin11() override {
+		return true;
 	}
 
 private:
@@ -61,6 +58,4 @@ private:
 	CONDITION_VARIABLE _cv{};
 	CRITICAL_SECTION _cs{};
 	bool _newFrameArrived = false;
-
-	ComPtr<ID3D11Texture2D> _output;
 };

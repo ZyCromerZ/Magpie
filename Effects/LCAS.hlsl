@@ -39,7 +39,7 @@ float4 Pass1(float2 pos) {
 	float3 h = INPUT.Sample(sam, pos + float2(0, inputPtY)).rgb;
         
 	// Edge checker
-        float sum = ((abs(e.g - b.g) - 0.5f) * 1.2 + 0.5f) + ((abs(e.g - h.g) - 0.5f) * 1.2 + 0.5f);
+	float sum = ((abs(e.g - b.g) - 0.5f) * 1.2 + 0.5f) + ((abs(e.g - h.g) - 0.5f) * 1.2 + 0.5f);
 	sum += ((abs(e.g - d.g) - 0.5f) * 1.2 + 0.5f) + ((abs(e.g - f.g) - 0.5f) * 1.2 + 0.5f);
 	
 	// Soft min and max.

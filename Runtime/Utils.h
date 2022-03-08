@@ -33,7 +33,7 @@ struct Utils {
 		return true;
 	}
 
-	static bool CheckOverlap(const RECT& r1, const RECT& r2) {
+	static bool CheckOverlap(const RECT& r1, const RECT& r2) noexcept {
 		return r1.right > r2.left && r1.bottom > r2.top && r1.left < r2.right&& r1.top < r2.bottom;
 	}
 
@@ -93,7 +93,7 @@ struct Utils {
 
 		bool Hash(void* data, size_t len, std::vector<BYTE>& result);
 
-		DWORD GetHashLength() {
+		DWORD GetHashLength() noexcept {
 			return _hashLen;
 		}
 	private:
@@ -125,3 +125,19 @@ struct Utils {
 
 	static HANDLE SafeHandle(HANDLE h) noexcept { return (h == INVALID_HANDLE_VALUE) ? nullptr : h; }
 };
+
+namespace std {
+
+// std::hash 的 std::pair 特化
+template<typename T1, typename T2>
+struct hash<std::pair<T1, T2>> {
+	typedef std::pair<T1, T2> argument_type;
+	typedef std::size_t result_type;
+	result_type operator()(argument_type const& s) const {
+		result_type const h1(std::hash<T1>()(s.first));
+		result_type const h2(std::hash<T2>{}(s.second));
+		return h1 ^ (h2 << 1);
+	}
+};
+
+}

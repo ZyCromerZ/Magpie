@@ -289,10 +289,10 @@ namespace Magpie.Properties {
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("0")]
-        public uint AdapterIdx {
+        [global::System.Configuration.DefaultSettingValueAttribute("-1")]
+        public int AdapterIdx {
             get {
-                return ((uint)(this["AdapterIdx"]));
+                return ((int)(this["AdapterIdx"]));
             }
             set {
                 this["AdapterIdx"] = value;
@@ -416,6 +416,18 @@ namespace Magpie.Properties {
             }
             set {
                 this["CustomCropping"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("True")]
+        public bool VSync {
+            get {
+                return ((bool)(this["VSync"]));
+            }
+            set {
+                this["VSync"] = value;
             }
         }
     }

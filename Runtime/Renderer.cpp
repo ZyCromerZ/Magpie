@@ -6,56 +6,44 @@
 #include <VertexTypes.h>
 #include "EffectCompiler.h"
 #include <rapidjson/document.h>
+#include "FrameSourceBase.h"
+#include "DeviceResources.h"
+#include "FrameRateDrawer.h"
+#include "GPUTimer.h"
+#include "CursorDrawer.h"
+#include "EffectDrawer.h"
 
 
-extern std::shared_ptr<spdlog::logger> logger;
+Renderer::Renderer() {}
 
+Renderer::~Renderer() {}
 
-bool Renderer::Initialize() {
+bool Renderer::Initialize(const std::string& effectsJson) {
+	_gpuTimer.reset(new GPUTimer());
+
 	if (!GetWindowRect(App::GetInstance().GetHwndSrc(), &_srcWndRect)) {
 		SPDLOG_LOGGER_ERROR(logger, MakeWin32ErrorMsg("GetWindowRect 失败"));
 		return false;
 	}
 
-	if (!_InitD3D()) {
-		SPDLOG_LOGGER_ERROR(logger, "_InitD3D 失败");
-		return false;
-	}
-
-	if (!_CreateSwapChain()) {
-		SPDLOG_LOGGER_ERROR(logger, "_CreateSwapChain 失败");
-		return false;
-	}
-
-	int frameRate = App::GetInstance().GetFrameRate();
-	
-	if (frameRate > 0) {
-		_timer.SetFixedTimeStep(true);
-		_timer.SetTargetElapsedSeconds(1.0 / frameRate);
-	} else {
-		_timer.SetFixedTimeStep(false);
-	}
-	
-	_timer.ResetElapsedTime();
-
-	return true;
-}
-
-bool Renderer::InitializeEffectsAndCursor(const std::string& effectsJson) {
 	RECT destRect;
 	if (!_ResolveEffectsJson(effectsJson, destRect)) {
 		SPDLOG_LOGGER_ERROR(logger, "_ResolveEffectsJson 失败");
 		return false;
 	}
+
+	ID3D11Texture2D* backBuffer = App::GetInstance().GetDeviceResources().GetBackBuffer();
 	
 	if (App::GetInstance().IsShowFPS()) {
-		if (!_frameRateDrawer.Initialize(_backBuffer, destRect)) {
+		_frameRateDrawer.reset(new FrameRateDrawer());
+		if (!_frameRateDrawer->Initialize(backBuffer, destRect)) {
 			SPDLOG_LOGGER_ERROR(logger, "初始化 FrameRateDrawer 失败");
 			return false;
 		}
 	}
 
-	if (!_cursorDrawer.Initialize(_backBuffer, destRect)) {
+	_cursorDrawer.reset(new CursorDrawer());
+	if (!_cursorDrawer->Initialize(backBuffer, destRect)) {
 		SPDLOG_LOGGER_ERROR(logger, "初始化 CursorDrawer 失败");
 		return false;
 	}
@@ -65,487 +53,18 @@ bool Renderer::InitializeEffectsAndCursor(const std::string& effectsJson) {
 
 
 void Renderer::Render() {
-	if (_waitingForNextFrame) {
-		_Render();
-	} else {
-		_timer.Tick(std::bind(&Renderer::_Render, this));
-	}
-}
-
-bool Renderer::GetRenderTargetView(ID3D11Texture2D* texture, ID3D11RenderTargetView** result) {
-	auto it = _rtvMap.find(texture);
-	if (it != _rtvMap.end()) {
-		*result = it->second.Get();
-		return true;
-	}
-
-	ComPtr<ID3D11RenderTargetView>& r = _rtvMap[texture];
-	HRESULT hr = _d3dDevice->CreateRenderTargetView(texture, nullptr, &r);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("CreateRenderTargetView 失败", hr));
-		return false;
-	} else {
-		*result = r.Get();
-		return true;
-	}
-}
-
-bool Renderer::GetShaderResourceView(ID3D11Texture2D* texture, ID3D11ShaderResourceView** result) {
-	auto it = _srvMap.find(texture);
-	if (it != _srvMap.end()) {
-		*result = it->second.Get();
-		return true;
-	}
-
-	ComPtr<ID3D11ShaderResourceView>& r = _srvMap[texture];
-	HRESULT hr = _d3dDevice->CreateShaderResourceView(texture, nullptr, &r);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("CreateShaderResourceView 失败", hr));
-		return false;
-	} else {
-		*result = r.Get();
-		return true;
-	}
-}
-
-bool Renderer::SetFillVS() {
-	if (!_fillVS) {
-		const char* src = "void m(uint i:SV_VERTEXID,out float4 p:SV_POSITION,out float2 c:TEXCOORD){c=float2(i&1,i>>1)*2;p=float4(c.x*2-1,-c.y*2+1,0,1);}";
-
-		ComPtr<ID3DBlob> blob;
-		if (!CompileShader(true, src, "m", &blob, "FillVS")) {
-			SPDLOG_LOGGER_ERROR(logger, "编译 FillVS 失败");
-			return false;
-		}
-
-		HRESULT hr = _d3dDevice->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &_fillVS);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 FillVS 失败", hr));
-			return false;
-		}
-	}
-	
-	_d3dDC->IASetInputLayout(nullptr);
-	_d3dDC->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
-	_d3dDC->VSSetShader(_fillVS.Get(), nullptr, 0);
-
-	return true;
-}
-
-
-bool Renderer::SetCopyPS(ID3D11SamplerState* sampler, ID3D11ShaderResourceView* input) {
-	if (!_copyPS) {
-		const char* src = "Texture2D t:register(t0);SamplerState s:register(s0);float4 m(float4 p:SV_POSITION,float2 c:TEXCOORD):SV_Target{return t.Sample(s,c);}";
-
-		ComPtr<ID3DBlob> blob;
-		if (!CompileShader(false, src, "m", &blob, "CopyPS")) {
-			SPDLOG_LOGGER_ERROR(logger, "编译 CopyPS 失败");
-			return false;
-		}
-
-		HRESULT hr = _d3dDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &_copyPS);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 CopyPS 失败", hr));
-			return false;
-		}
-	}
-
-	_d3dDC->PSSetShader(_copyPS.Get(), nullptr, 0);
-	_d3dDC->PSSetConstantBuffers(0, 0, nullptr);
-	_d3dDC->PSSetShaderResources(0, 1, &input);
-	_d3dDC->PSSetSamplers(0, 1, &sampler);
-
-	return true;
-}
-
-bool Renderer::SetSimpleVS(ID3D11Buffer* simpleVB) {
-	if (!_simpleVS) {
-		const char* src = "void m(float4 p:SV_POSITION,float2 c:TEXCOORD,out float4 q:SV_POSITION,out float2 d:TEXCOORD) {q=p;d=c;}";
-
-		ComPtr<ID3DBlob> blob;
-		if (!CompileShader(true, src, "m", &blob, "SimpleVS")) {
-			SPDLOG_LOGGER_ERROR(logger, "编译 SimpleVS 失败");
-			return false;
-		}
-
-		HRESULT hr = _d3dDevice->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &_simpleVS);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 SimpleVS 失败", hr));
-			return false;
-		}
-
-		hr = _d3dDevice->CreateInputLayout(
-			VertexPositionTexture::InputElements,
-			VertexPositionTexture::InputElementCount,
-			blob->GetBufferPointer(),
-			blob->GetBufferSize(),
-			&_simpleIL
-		);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 SimpleVS 输入布局失败", hr));
-			return false;
-		}
-	}
-
-	_d3dDC->IASetInputLayout(_simpleIL.Get());
-
-	UINT stride = sizeof(VertexPositionTexture);
-	UINT offset = 0;
-	_d3dDC->IASetVertexBuffers(0, 1, &simpleVB, &stride, &offset);
-
-	_d3dDC->VSSetShader(_simpleVS.Get(), nullptr, 0);
-
-	return true;
-}
-
-static inline void LogAdapter(const DXGI_ADAPTER_DESC1& adapterDesc) {
-	SPDLOG_LOGGER_INFO(logger, fmt::format("当前图形适配器：\n\tVendorId：{:#x}\n\tDeviceId：{:#x}\n\t描述：{}",
-		adapterDesc.VendorId, adapterDesc.DeviceId, StrUtils::UTF16ToUTF8(adapterDesc.Description)));
-}
-
-static ComPtr<IDXGIAdapter1> ObtainGraphicsAdapter(IDXGIFactory1* dxgiFactory, UINT adapterIdx) {
-	ComPtr<IDXGIAdapter1> adapter;
-
-	HRESULT hr = dxgiFactory->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf());
-	if (SUCCEEDED(hr)) {
-		DXGI_ADAPTER_DESC1 desc;
-		HRESULT hr = adapter->GetDesc1(&desc);
-		if (FAILED(hr)) {
-			return nullptr;
-		}
-
-		LogAdapter(desc);
-		return adapter;
-	}
-
-	// 指定 GPU 失败，回落到普通方式
-	ComPtr<IDXGIAdapter1> warpAdapter;
-	DXGI_ADAPTER_DESC1 warpDesc;
-
-	for (UINT adapterIndex = 0;
-			SUCCEEDED(dxgiFactory->EnumAdapters1(adapterIndex,
-				adapter.ReleaseAndGetAddressOf()));
-			adapterIndex++
-	) {
-		DXGI_ADAPTER_DESC1 desc;
-		HRESULT hr = adapter->GetDesc1(&desc);
-		if (FAILED(hr)) {
-			return nullptr;
-		}
-
-		if (desc.Flags == DXGI_ADAPTER_FLAG_SOFTWARE) {
-			warpAdapter = adapter;
-			warpDesc = desc;
-			continue;
-		}
-
-		LogAdapter(desc);
-		return adapter;
-	}
-
-	// 回落到 Basic Render Driver Adapter（WARP）
-	// https://docs.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp
-	if (warpAdapter) {
-		LogAdapter(warpDesc);
-		return warpAdapter;
-	} else {
-		return nullptr;
-	}
-}
-
-bool Renderer::CompileShader(bool isVS, std::string_view hlsl, const char* entryPoint,
-	ID3DBlob** blob, const char* sourceName, ID3DInclude* include
-) {
-	ComPtr<ID3DBlob> errorMsgs = nullptr;
-
-	UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
-	const char* target;
-	if (isVS) {
-		target = _featureLevel >= D3D_FEATURE_LEVEL_11_0 ? "vs_5_0" :
-			(_featureLevel == D3D_FEATURE_LEVEL_10_1 ? "vs_4_1" : "vs_4_0");
-	} else {
-		target = _featureLevel >= D3D_FEATURE_LEVEL_11_0 ? "ps_5_0" :
-			(_featureLevel == D3D_FEATURE_LEVEL_10_1 ? "ps_4_1" : "ps_4_0");
-	} 
-
-	HRESULT hr = D3DCompile(hlsl.data(), hlsl.size(), sourceName, nullptr, include,
-		entryPoint, target, flags, 0, blob, &errorMsgs);
-	if (FAILED(hr)) {
-		if (errorMsgs) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg(fmt::format("编译{}着色器失败：{}",
-				isVS ? "顶点" : "像素", (const char*)errorMsgs->GetBufferPointer()), hr));
-		}
-		return false;
-	} else {
-		if (errorMsgs) {
-			// 显示警告消息
-			SPDLOG_LOGGER_WARN(logger, fmt::format("编译{}着色器时产生警告：{}",
-				isVS ? "顶点" : "像素", (const char*)errorMsgs->GetBufferPointer()));
-		}
-	}
-
-	return true;
-}
-
-bool Renderer::IsDebugLayersAvailable() {
-#ifdef _DEBUG
-	static std::optional<bool> result = std::nullopt;
-
-	if (!result.has_value()) {
-		HRESULT hr = D3D11CreateDevice(
-			nullptr,
-			D3D_DRIVER_TYPE_NULL,       // There is no need to create a real hardware device.
-			nullptr,
-			D3D11_CREATE_DEVICE_DEBUG,  // Check for the SDK layers.
-			nullptr,                    // Any feature level will do.
-			0,
-			D3D11_SDK_VERSION,
-			nullptr,                    // No need to keep the D3D device reference.
-			nullptr,                    // No need to know the feature level.
-			nullptr                     // No need to keep the D3D device context reference.
-		);
-
-		result = SUCCEEDED(hr);
-	}
-
-	return result.value_or(false);
-#else
-	// Relaese 配置不使用调试层
-	return false;
-#endif
-}
-
-bool Renderer::_InitD3D() {
-	HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(_dxgiFactory.ReleaseAndGetAddressOf()));
-	if (FAILED(hr)) {
-		return false;
-	}
-
-	// 检查可变帧率支持
-	BOOL supportTearing = FALSE;
-	ComPtr<IDXGIFactory5> dxgiFactory5;
-	hr = _dxgiFactory.As<IDXGIFactory5>(&dxgiFactory5);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("获取 IDXGIFactory5 失败", hr));
-	} else {
-		hr = dxgiFactory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &supportTearing, sizeof(supportTearing));
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("CheckFeatureSupport 失败", hr));
-		}
-	}
-
-	SPDLOG_LOGGER_INFO(logger, fmt::format("可变刷新率支持：{}", supportTearing ? "是" : "否"));
-
-	if (App::GetInstance().GetFrameRate() != 0 && !supportTearing) {
-		SPDLOG_LOGGER_ERROR(logger, "当前显示器不支持可变刷新率");
-		App::GetInstance().SetErrorMsg(ErrorMessages::VSYNC_OFF_NOT_SUPPORTED);
-		return false;
-	}
-
-	UINT createDeviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-	if (IsDebugLayersAvailable()) {
-		// 在 DEBUG 配置启用调试层
-		createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
-	}
-
-	D3D_FEATURE_LEVEL featureLevels[] = {
-		D3D_FEATURE_LEVEL_11_1,
-		D3D_FEATURE_LEVEL_11_0,
-		D3D_FEATURE_LEVEL_10_1,
-		D3D_FEATURE_LEVEL_10_0,
-		// 不支持功能级别 9.x，但这里加上没坏处
-		D3D_FEATURE_LEVEL_9_3,
-		D3D_FEATURE_LEVEL_9_2,
-		D3D_FEATURE_LEVEL_9_1,
-	};
-	UINT nFeatureLevels = ARRAYSIZE(featureLevels);
-
-	_graphicsAdapter = ObtainGraphicsAdapter(_dxgiFactory.Get(), App::GetInstance().GetAdapterIdx());
-	if (!_graphicsAdapter) {
-		SPDLOG_LOGGER_ERROR(logger, "找不到可用 Adapter");
-		return false;
-	}
-
-	ComPtr<ID3D11Device> d3dDevice;
-	ComPtr<ID3D11DeviceContext> d3dDC;
-	hr = D3D11CreateDevice(
-		_graphicsAdapter.Get(),
-		D3D_DRIVER_TYPE_UNKNOWN,
-		nullptr,
-		createDeviceFlags,
-		featureLevels,
-		nFeatureLevels,
-		D3D11_SDK_VERSION,
-		&d3dDevice,
-		&_featureLevel,
-		&d3dDC
-	);
-
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("D3D11CreateDevice 失败", hr));
-		return false;
-	}
-
-	std::string_view fl;
-	switch (_featureLevel) {
-	case D3D_FEATURE_LEVEL_11_1:
-		fl = "11.1";
-		break;
-	case D3D_FEATURE_LEVEL_11_0:
-		fl = "11.0";
-		break;
-	case D3D_FEATURE_LEVEL_10_1:
-		fl = "10.1";
-		break;
-	case D3D_FEATURE_LEVEL_10_0:
-		fl = "10.0";
-		break;
-	case D3D_FEATURE_LEVEL_9_3:
-		fl = "9.3";
-		break;
-	case D3D_FEATURE_LEVEL_9_2:
-		fl = "9.2";
-		break;
-	case D3D_FEATURE_LEVEL_9_1:
-		fl = "9.1";
-		break;
-	default:
-		fl = "未知";
-		break;
-	}
-	SPDLOG_LOGGER_INFO(logger, fmt::format("已创建 D3D Device\n\t功能级别：{}", fl));
-
-	hr = d3dDevice.As<ID3D11Device1>(&_d3dDevice);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("获取 ID3D11Device1 失败", hr));
-		return false;
-	}
-
-	hr = d3dDC.As<ID3D11DeviceContext1>(&_d3dDC);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("获取 ID3D11DeviceContext1 失败", hr));
-		return false;
-	}
-
-	hr = _d3dDevice.As<IDXGIDevice1>(&_dxgiDevice);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("获取 IDXGIDevice 失败", hr));
-		return false;
-	}
-
-	return true;
-}
-
-bool Renderer::_CreateSwapChain() {
-	const RECT& hostWndRect = App::GetInstance().GetHostWndRect();
-
-	DXGI_SWAP_CHAIN_DESC1 sd = {};
-	sd.Width = hostWndRect.right - hostWndRect.left;
-	sd.Height = hostWndRect.bottom - hostWndRect.top;
-	sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-	sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-	sd.SampleDesc.Count = 1;
-	sd.SampleDesc.Quality = 0;
-	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
-	sd.BufferCount = (App::GetInstance().IsDisableLowLatency() && App::GetInstance().GetFrameRate() == 0) ? 3 : 2;
-	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	sd.Flags = App::GetInstance().GetFrameRate() != 0 ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-
-	ComPtr<IDXGISwapChain1> dxgiSwapChain = nullptr;
-	HRESULT hr = _dxgiFactory->CreateSwapChainForHwnd(
-		_d3dDevice.Get(),
-		App::GetInstance().GetHwndHost(),
-		&sd,
-		nullptr,
-		nullptr,
-		&dxgiSwapChain
-	);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建交换链失败", hr));
-		return false;
-	}
-
-	hr = dxgiSwapChain.As<IDXGISwapChain2>(&_dxgiSwapChain);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("获取 IDXGISwapChain2 失败", hr));
-		return false;
-	}
-
-	if (App::GetInstance().GetFrameRate() != 0) {
-		hr = _dxgiDevice->SetMaximumFrameLatency(1);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("SetMaximumFrameLatency 失败", hr));
-		}
-	} else {
-		// 关闭低延迟模式时将最大延迟设为 2 以使 CPU 和 GPU 并行执行
-		_dxgiSwapChain->SetMaximumFrameLatency(App::GetInstance().IsDisableLowLatency() ? 2 : 1);
-
-		_frameLatencyWaitableObject.reset(_dxgiSwapChain->GetFrameLatencyWaitableObject());
-		if (!_frameLatencyWaitableObject) {
-			SPDLOG_LOGGER_ERROR(logger, "GetFrameLatencyWaitableObject 失败");
-			return false;
-		}
-	}
-
-	hr = _dxgiFactory->MakeWindowAssociation(App::GetInstance().GetHwndHost(), DXGI_MWA_NO_ALT_ENTER);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("MakeWindowAssociation 失败", hr));
-	}
-
-	// 检查 Multiplane Overlay 和 Hardware Composition 支持
-	BOOL supportMPO = FALSE;
-	BOOL supportHardwareComposition = FALSE;
-	ComPtr<IDXGIOutput> output;
-	hr = _dxgiSwapChain->GetContainingOutput(&output);
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("获取 IDXGIOutput 失败", hr));
-	} else {
-		ComPtr<IDXGIOutput2> output2;
-		hr = output.As<IDXGIOutput2>(&output2);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("获取 IDXGIOutput2 失败", hr));
-		} else {
-			supportMPO = output2->SupportsOverlays();
-		}
-		
-		ComPtr<IDXGIOutput6> output6;
-		hr = output.As<IDXGIOutput6>(&output6);
-		if (FAILED(hr)) {
-			SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("获取 IDXGIOutput6 失败", hr));
-		} else {
-			UINT flags;
-			hr = output6->CheckHardwareCompositionSupport(&flags);
-			if (FAILED(hr)) {
-				SPDLOG_LOGGER_WARN(logger, MakeComErrorMsg("CheckHardwareCompositionSupport 失败", hr));
-			} else {
-				supportHardwareComposition = flags & DXGI_HARDWARE_COMPOSITION_SUPPORT_FLAG_WINDOWED;
-			}
-		}
-	}
-
-	SPDLOG_LOGGER_INFO(logger, fmt::format("Hardware Composition 支持：{}", supportHardwareComposition ? "是" : "否"));
-	SPDLOG_LOGGER_INFO(logger, fmt::format("Multiplane Overlay 支持：{}", supportMPO ? "是" : "否"));
-
-	hr = _dxgiSwapChain->GetBuffer(0, IID_PPV_ARGS(_backBuffer.ReleaseAndGetAddressOf()));
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("获取后缓冲区失败", hr));
-		return false;
-	}
-
-	return true;
-}
-
-void Renderer::_Render() {
-	int frameRate = App::GetInstance().GetFrameRate();
-
-	if (!_waitingForNextFrame && frameRate == 0) {
-		WaitForSingleObjectEx(_frameLatencyWaitableObject.get(), 1000, TRUE);
-	}
-
 	if (!_CheckSrcState()) {
 		SPDLOG_LOGGER_INFO(logger, "源窗口状态改变，退出全屏");
-		App::GetInstance().Close();
+		App::GetInstance().Quit();
 		return;
+	}
+
+	DeviceResources& dr = App::GetInstance().GetDeviceResources();
+	ID3D11DeviceContext3* d3dDC = dr.GetD3DDC();
+
+	if (!_waitingForNextFrame) {
+		dr.BeginFrame();
+		_gpuTimer->BeginFrame();
 	}
 
 	auto state = App::GetInstance().GetFrameSource().Update();
@@ -555,11 +74,11 @@ void Renderer::_Render() {
 		return;
 	}
 
-	_d3dDC->ClearState();
+	d3dDC->ClearState();
 	// 所有渲染都使用三角形带拓扑
-	_d3dDC->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	d3dDC->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-	if (!_cursorDrawer.Update()) {
+	if (!_cursorDrawer->Update()) {
 		SPDLOG_LOGGER_ERROR(logger, "更新光标位置失败");
 	}
 
@@ -569,8 +88,8 @@ void Renderer::_Render() {
 	}
 
 	if (state == FrameSourceBase::UpdateState::NewFrame) {
-		for (EffectDrawer& effect : _effects) {
-			effect.Draw();
+		for (auto& effect : _effects) {
+			effect->Draw();
 		}
 	} else {
 		// 此帧内容无变化
@@ -579,32 +98,129 @@ void Renderer::_Render() {
 
 		size_t i = 0;
 		for (; i < _effects.size(); ++i) {
-			if (_effects[i].HasDynamicConstants()) {
+			if (_effects[i]->HasDynamicConstants()) {
 				break;
 			}
 		}
 
 		if (i == _effects.size()) {
 			// 只渲染最后一个 Effect 的最后一个 pass
-			_effects.back().Draw(true);
+			_effects.back()->Draw(true);
 		} else {
 			for (; i < _effects.size(); ++i) {
-				_effects[i].Draw();
+				_effects[i]->Draw();
 			}
 		}
 	}
 
 	if (App::GetInstance().IsShowFPS()) {
-		_frameRateDrawer.Draw();
+		_frameRateDrawer->Draw();
 	}
 
-	_cursorDrawer.Draw();
+	_cursorDrawer->Draw();
 
-	if (frameRate != 0) {
-		_dxgiSwapChain->Present(0, DXGI_PRESENT_ALLOW_TEARING);
-	} else {
-		_dxgiSwapChain->Present(1, 0);
+	dr.EndFrame();
+}
+
+bool Renderer::SetFillVS() {
+	auto& dr = App::GetInstance().GetDeviceResources();
+
+	if (!_fillVS) {
+		const char* src = "void m(uint i:SV_VERTEXID,out float4 p:SV_POSITION,out float2 c:TEXCOORD){c=float2(i&1,i>>1)*2;p=float4(c.x*2-1,-c.y*2+1,0,1);}";
+
+		winrt::com_ptr<ID3DBlob> blob;
+		if (!dr.CompileShader(true, src, "m", blob.put(), "FillVS")) {
+			SPDLOG_LOGGER_ERROR(logger, "编译 FillVS 失败");
+			return false;
+		}
+
+		HRESULT hr = dr.GetD3DDevice()->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, _fillVS.put());
+		if (FAILED(hr)) {
+			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 FillVS 失败", hr));
+			return false;
+		}
 	}
+	
+	auto d3dDC = dr.GetD3DDC();
+	d3dDC->IASetInputLayout(nullptr);
+	d3dDC->IASetVertexBuffers(0, 0, nullptr, nullptr, nullptr);
+	d3dDC->VSSetShader(_fillVS.get(), nullptr, 0);
+
+	return true;
+}
+
+
+bool Renderer::SetCopyPS(ID3D11SamplerState* sampler, ID3D11ShaderResourceView* input) {
+	auto& dr = App::GetInstance().GetDeviceResources();
+
+	if (!_copyPS) {
+		const char* src = "Texture2D t:register(t0);SamplerState s:register(s0);float4 m(float4 p:SV_POSITION,float2 c:TEXCOORD):SV_Target{return t.Sample(s,c);}";
+
+		winrt::com_ptr<ID3DBlob> blob;
+		if (!dr.CompileShader(false, src, "m", blob.put(), "CopyPS")) {
+			SPDLOG_LOGGER_ERROR(logger, "编译 CopyPS 失败");
+			return false;
+		}
+
+		HRESULT hr = dr.GetD3DDevice()->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, _copyPS.put());
+		if (FAILED(hr)) {
+			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 CopyPS 失败", hr));
+			return false;
+		}
+	}
+
+	auto d3dDC = dr.GetD3DDC();
+	d3dDC->PSSetShader(_copyPS.get(), nullptr, 0);
+	d3dDC->PSSetConstantBuffers(0, 0, nullptr);
+	d3dDC->PSSetShaderResources(0, 1, &input);
+	d3dDC->PSSetSamplers(0, 1, &sampler);
+
+	return true;
+}
+
+bool Renderer::SetSimpleVS(ID3D11Buffer* simpleVB) {
+	auto& dr = App::GetInstance().GetDeviceResources();
+
+	if (!_simpleVS) {
+		const char* src = "void m(float4 p:SV_POSITION,float2 c:TEXCOORD,out float4 q:SV_POSITION,out float2 d:TEXCOORD) {q=p;d=c;}";
+
+		winrt::com_ptr<ID3DBlob> blob;
+		if (!dr.CompileShader(true, src, "m", blob.put(), "SimpleVS")) {
+			SPDLOG_LOGGER_ERROR(logger, "编译 SimpleVS 失败");
+			return false;
+		}
+
+		auto d3dDevice = dr.GetD3DDevice();
+
+		HRESULT hr = d3dDevice->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, _simpleVS.put());
+		if (FAILED(hr)) {
+			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 SimpleVS 失败", hr));
+			return false;
+		}
+
+		hr = d3dDevice->CreateInputLayout(
+			VertexPositionTexture::InputElements,
+			VertexPositionTexture::InputElementCount,
+			blob->GetBufferPointer(),
+			blob->GetBufferSize(),
+			_simpleIL.put()
+		);
+		if (FAILED(hr)) {
+			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 SimpleVS 输入布局失败", hr));
+			return false;
+		}
+	}
+
+	auto d3dDC = dr.GetD3DDC();
+	d3dDC->IASetInputLayout(_simpleIL.get());
+
+	UINT stride = sizeof(VertexPositionTexture);
+	UINT offset = 0;
+	d3dDC->IASetVertexBuffers(0, 1, &simpleVB, &stride, &offset);
+
+	d3dDC->VSSetShader(_simpleVS.get(), nullptr, 0);
+
+	return true;
 }
 
 bool CheckForeground(HWND hwndForeground) {
@@ -633,7 +249,7 @@ bool CheckForeground(HWND hwndForeground) {
 		}
 
 		// 弹窗如果完全在源窗口客户区内则不退出全屏
-		const RECT& srcFrameRect = App::GetInstance().GetSrcFrameRect();
+		const RECT& srcFrameRect = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 		if (rectForground.left >= srcFrameRect.left
 			&& rectForground.right <= srcFrameRect.right
 			&& rectForground.top >= srcFrameRect.top
@@ -769,7 +385,7 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 			return false;
 		}
 
-		EffectDrawer& effect = _effects.emplace_back();
+		EffectDrawer& effect = *_effects.emplace_back(new EffectDrawer());
 
 		auto effectName = effectJson.FindMember("effect");
 		if (effectName == effectJson.MemberEnd() || !effectName->value.IsString()) {
@@ -840,7 +456,10 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 			}
 		}
 
+#pragma push_macro("GetObject")
+#undef GetObject
 		for (const auto& prop : effectJson.GetObject()) {
+#pragma pop_macro("GetObject")
 			if (!prop.name.IsString()) {
 				SPDLOG_LOGGER_ERROR(logger, "解析 json 失败：非法的效果名");
 				return false;
@@ -892,14 +511,17 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 		}
 	}
 
+	auto& dr = App::GetInstance().GetDeviceResources();
+	auto d3dDevice = dr.GetD3DDevice();
+
 	if (_effects.size() == 1) {
-		if (!_effects.back().Build(_effectInput, _backBuffer)) {
+		if (!_effects.back()->Build(_effectInput.get(), dr.GetBackBuffer())) {
 			SPDLOG_LOGGER_ERROR(logger, "构建效果失败");
 			return false;
 		}
 	} else {
 		// 创建效果间的中间纹理
-		ComPtr<ID3D11Texture2D> curTex = _effectInput;
+		winrt::com_ptr<ID3D11Texture2D> curTex = _effectInput;
 
 		D3D11_TEXTURE2D_DESC desc{};
 		desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -916,14 +538,14 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 			desc.Width = texSize.cx;
 			desc.Height = texSize.cy;
 
-			ComPtr<ID3D11Texture2D> outputTex;
-			HRESULT hr = _d3dDevice->CreateTexture2D(&desc, nullptr, &outputTex);
+			winrt::com_ptr<ID3D11Texture2D> outputTex;
+			HRESULT hr = d3dDevice->CreateTexture2D(&desc, nullptr, outputTex.put());
 			if (FAILED(hr)) {
 				SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("CreateTexture2D 失败", hr));
 				return false;
 			}
 
-			if (!_effects[i].Build(curTex, outputTex)) {
+			if (!_effects[i]->Build(curTex.get(), outputTex.get())) {
 				SPDLOG_LOGGER_ERROR(logger, "构建效果失败");
 				return false;
 			}
@@ -932,7 +554,7 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 		}
 
 		// 最后一个效果输出到后缓冲纹理
-		if (!_effects.back().Build(curTex, _backBuffer)) {
+		if (!_effects.back()->Build(curTex.get(), dr.GetBackBuffer())) {
 			SPDLOG_LOGGER_ERROR(logger, "构建效果失败");
 			return false;
 		}
@@ -948,8 +570,10 @@ bool Renderer::_ResolveEffectsJson(const std::string& effectsJson, RECT& destRec
 }
 
 bool Renderer::SetAlphaBlend(bool enable) {
+	auto& dr = App::GetInstance().GetDeviceResources();
+
 	if (!enable) {
-		_d3dDC->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+		dr.GetD3DDC()->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 		return true;
 	}
 	
@@ -963,62 +587,13 @@ bool Renderer::SetAlphaBlend(bool enable) {
 		desc.RenderTarget[0].BlendOp = desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
 		desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 
-		HRESULT hr = _d3dDevice->CreateBlendState(&desc, &_alphaBlendState);
+		HRESULT hr = dr.GetD3DDevice()->CreateBlendState(&desc, _alphaBlendState.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_CRITICAL(logger, MakeComErrorMsg("CreateBlendState 失败", hr));
 			return false;
 		}
 	}
 	
-	_d3dDC->OMSetBlendState(_alphaBlendState.Get(), nullptr, 0xffffffff);
-	return true;
-}
-
-bool Renderer::GetSampler(EffectSamplerFilterType filterType, EffectSamplerAddressType addressType, ID3D11SamplerState** result) {
-	ID3D11SamplerState** sampler;
-	D3D11_TEXTURE_ADDRESS_MODE addressMode;
-	D3D11_FILTER filter;
-
-	if (filterType == EffectSamplerFilterType::Linear) {
-		filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-		if (addressType == EffectSamplerAddressType::Clamp) {
-			sampler = _linearClampSampler.GetAddressOf();
-			addressMode = D3D11_TEXTURE_ADDRESS_CLAMP;
-		} else {
-			sampler = _linearWrapSampler.GetAddressOf();
-			addressMode = D3D11_TEXTURE_ADDRESS_WRAP;
-		}
-	} else {
-		filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-		if (addressType == EffectSamplerAddressType::Clamp) {
-			sampler = _pointClampSampler.GetAddressOf();
-			addressMode = D3D11_TEXTURE_ADDRESS_CLAMP;
-		} else {
-			sampler = _pointWrapSampler.GetAddressOf();
-			addressMode = D3D11_TEXTURE_ADDRESS_WRAP;
-		}
-	}
-	
-	if (*sampler) {
-		*result = *sampler;
-		return true;
-	}
-
-	D3D11_SAMPLER_DESC desc{};
-	desc.Filter = filter;
-	desc.AddressU = addressMode;
-	desc.AddressV = addressMode;
-	desc.AddressW = addressMode;
-	desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-	desc.MinLOD = 0;
-	desc.MaxLOD = 0;
-	HRESULT hr = _d3dDevice->CreateSamplerState(&desc, sampler);
-
-	if (FAILED(hr)) {
-		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 ID3D11SamplerState 出错", hr));
-		return false;
-	}
-
-	*result = *sampler;
+	dr.GetD3DDC()->OMSetBlendState(_alphaBlendState.get(), nullptr, 0xffffffff);
 	return true;
 }

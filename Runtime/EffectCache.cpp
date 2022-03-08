@@ -9,13 +9,15 @@
 #include "EffectCompiler.h"
 #include <regex>
 #include "App.h"
+#include "DeviceResources.h"
+#include "StrUtils.h"
 
 
 template<typename Archive>
-void serialize(Archive& ar, ComPtr<ID3DBlob>& o) {
+void serialize(Archive& ar, winrt::com_ptr<ID3DBlob>& o) {
 	SIZE_T size = 0;
 	ar& size;
-	HRESULT hr = D3DCreateBlob(size, o.ReleaseAndGetAddressOf());
+	HRESULT hr = D3DCreateBlob(size, o.put());
 	if (FAILED(hr)) {
 		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("D3DCreateBlob 失败", hr));
 		throw new std::exception();
@@ -28,7 +30,7 @@ void serialize(Archive& ar, ComPtr<ID3DBlob>& o) {
 }
 
 template<typename Archive>
-void serialize(Archive& ar, const ComPtr<ID3DBlob>& o) {
+void serialize(Archive& ar, const winrt::com_ptr<ID3DBlob>& o) {
 	SIZE_T size = o->GetBufferSize();
 	ar& size;
 
@@ -226,7 +228,7 @@ bool EffectCache::Load(const wchar_t* fileName, std::string_view hash, EffectDes
 		// 检查 Direct3D 功能级别
 		D3D_FEATURE_LEVEL fl;
 		ia& fl;
-		if (fl != App::GetInstance().GetRenderer().GetFeatureLevel()) {
+		if (fl != App::GetInstance().GetDeviceResources().GetFeatureLevel()) {
 			SPDLOG_LOGGER_INFO(logger, "功能级别不匹配");
 			return false;
 		}
@@ -261,7 +263,7 @@ void EffectCache::Save(const wchar_t* fileName, std::string_view hash, const Eff
 		yas::binary_oarchive<yas::vector_ostream<BYTE>, yas::binary> oa(os);
 
 		oa& _VERSION;
-		oa& App::GetInstance().GetRenderer().GetFeatureLevel();
+		oa& App::GetInstance().GetDeviceResources().GetFeatureLevel();
 		oa& desc;
 	} catch (...) {
 		SPDLOG_LOGGER_ERROR(logger, "序列化失败");
@@ -295,7 +297,7 @@ void EffectCache::Save(const wchar_t* fileName, std::string_view hash, const Eff
 		HANDLE hFind = Utils::SafeHandle(FindFirstFile(L".\\cache\\*", &findData));
 		if (hFind) {
 			while (FindNextFile(hFind, &findData)) {
-				if (lstrlenW(findData.cFileName) < 8) {
+				if (StrUtils::StrLen(findData.cFileName) < 8) {
 					continue;
 				}
 

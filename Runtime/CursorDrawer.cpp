@@ -3,6 +3,10 @@
 #include "App.h"
 #include "Utils.h"
 #include <VertexTypes.h>
+#include "Renderer.h"
+#include "FrameSourceBase.h"
+#include "DeviceResources.h"
+
 
 extern std::shared_ptr<spdlog::logger> logger;
 
@@ -31,12 +35,14 @@ float4 main(float4 pos : SV_POSITION, float2 coord : TEXCOORD) : SV_Target{
 }
 )";
 
-bool CursorDrawer::Initialize(ComPtr<ID3D11Texture2D> renderTarget, const RECT& destRect) {
+bool CursorDrawer::Initialize(ID3D11Texture2D* renderTarget, const RECT& destRect) {
 	App& app = App::GetInstance();
+	auto& dr = app.GetDeviceResources();
+
 	if (!app.IsNoCursor()) {
 		Renderer& renderer = app.GetRenderer();
-		_d3dDC = renderer.GetD3DDC();
-		_d3dDevice = renderer.GetD3DDevice();
+		auto d3dDC = dr.GetD3DDC();
+		auto d3dDevice = dr.GetD3DDevice();
 
 		_zoomFactorX = _zoomFactorY = App::GetInstance().GetCursorZoomFactor();
 		if (_zoomFactorX <= 0) {
@@ -46,24 +52,24 @@ bool CursorDrawer::Initialize(ComPtr<ID3D11Texture2D> renderTarget, const RECT& 
 			_zoomFactorY = float(destRect.bottom - destRect.top) / desc.Height;
 		}
 
-		if (!renderer.GetRenderTargetView(renderTarget.Get(), &_rtv)) {
+		if (!dr.GetRenderTargetView(renderTarget, &_rtv)) {
 			SPDLOG_LOGGER_ERROR(logger, "GetRenderTargetView 失败");
 			return false;
 		}
 
-		if (!renderer.GetShaderResourceView(renderTarget.Get(), &_renderTargetSrv)) {
+		if (!dr.GetShaderResourceView(renderTarget, &_renderTargetSrv)) {
 			SPDLOG_LOGGER_ERROR(logger, "GetShaderResourceView 失败");
 			return false;
 		}
 
-		ComPtr<ID3DBlob> blob;
-		if (!renderer.CompileShader(false, monochromeCursorPS, "main", &blob, "MonochromeCursorPS")) {
+		winrt::com_ptr<ID3DBlob> blob;
+		if (!dr.CompileShader(false, monochromeCursorPS, "main", blob.put(), "MonochromeCursorPS")) {
 			SPDLOG_LOGGER_ERROR(logger, "编译 MonochromeCursorPS 失败");
 			return false;
 		}
 
-		HRESULT hr = renderer.GetD3DDevice()->CreatePixelShader(
-			blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &_monoCursorPS);
+		HRESULT hr = d3dDevice->CreatePixelShader(
+			blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, _monoCursorPS.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 MonochromeCursorPS 失败", hr));
 			return false;
@@ -75,14 +81,14 @@ bool CursorDrawer::Initialize(ComPtr<ID3D11Texture2D> renderTarget, const RECT& 
 		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-		hr = renderer.GetD3DDevice()->CreateBuffer(&bd, nullptr, &_vtxBuffer);
+		hr = d3dDevice->CreateBuffer(&bd, nullptr, _vtxBuffer.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建顶点缓冲区失败", hr));
 			return false;
 		}
 
-		if (!renderer.GetSampler(EffectSamplerFilterType::Linear, EffectSamplerAddressType::Clamp, &_linearSam)
-			|| !renderer.GetSampler(EffectSamplerFilterType::Point, EffectSamplerAddressType::Clamp, &_pointSam)
+		if (!dr.GetSampler(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, &_linearSam)
+			|| !dr.GetSampler(D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP, &_pointSam)
 		) {
 			SPDLOG_LOGGER_ERROR(logger, "GetSampler 失败");
 			return false;
@@ -101,18 +107,18 @@ bool CursorDrawer::Initialize(ComPtr<ID3D11Texture2D> renderTarget, const RECT& 
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 
-		hr = _d3dDevice->CreateTexture2D(&desc, nullptr, &_monoTmpTexture);
+		hr = d3dDevice->CreateTexture2D(&desc, nullptr, _monoTmpTexture.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 Texture2D 失败", hr));
 			return false;
 		}
 
-		if (!renderer.GetRenderTargetView(_monoTmpTexture.Get(), &_monoTmpRtv)) {
+		if (!dr.GetRenderTargetView(_monoTmpTexture.get(), &_monoTmpRtv)) {
 			SPDLOG_LOGGER_ERROR(logger, "GetRenderTargetView 失败");
 			return false;
 		}
 
-		if (!renderer.GetShaderResourceView(_monoTmpTexture.Get(), &_monoTmpSrv)) {
+		if (!dr.GetShaderResourceView(_monoTmpTexture.get(), &_monoTmpSrv)) {
 			SPDLOG_LOGGER_ERROR(logger, "GetShaderResourceView 失败");
 			return false;
 		}
@@ -124,7 +130,7 @@ bool CursorDrawer::Initialize(ComPtr<ID3D11Texture2D> renderTarget, const RECT& 
 		_destRect = destRect;
 	}
 
-	const RECT& srcFrameRect = app.GetSrcFrameRect();
+	const RECT& srcFrameRect = app.GetFrameSource().GetSrcFrameRect();
 	SIZE srcSize = { srcFrameRect.right - srcFrameRect.left, srcFrameRect.bottom - srcFrameRect.top };
 
 	_clientScaleX = float(destRect.right - destRect.left) / srcSize.cx;
@@ -184,7 +190,7 @@ CursorDrawer::~CursorDrawer() {
 }
 
 void CursorDrawer::_DynamicClip(POINT cursorPt) {
-	const RECT& srcFrameRect = App::GetInstance().GetSrcFrameRect();
+	const RECT& srcFrameRect = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 	const RECT& hostRect = App::GetInstance().GetHostWndRect();
 
 	POINT hostPt{};
@@ -239,7 +245,7 @@ bool CursorDrawer::Update() {
 	}
 
 	if (_isUnderCapture) {
-		const RECT& srcFrameRect = App::GetInstance().GetSrcFrameRect();
+		const RECT& srcFrameRect = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 
 		if (PtInRect(&srcFrameRect, cursorPt)) {
 			_DynamicClip(cursorPt);
@@ -309,7 +315,8 @@ bool CursorDrawer::_ResolveCursor(HCURSOR hCursor, _CursorInfo& result) const {
 		DeleteBitmap(ii.hbmMask);
 	});
 
-	ComPtr<ID3D11Texture2D> texture;
+	auto d3dDevice = App::GetInstance().GetDeviceResources().GetD3DDevice();
+	winrt::com_ptr<ID3D11Texture2D> texture;
 
 	if(ii.hbmColor == NULL) {
 		// 单色光标
@@ -378,7 +385,7 @@ bool CursorDrawer::_ResolveCursor(HCURSOR hCursor, _CursorInfo& result) const {
 			initData.pSysMem = &pixels[0];
 			initData.SysMemPitch = result.width * 4;
 
-			HRESULT hr = _d3dDevice->CreateTexture2D(&desc, &initData, &texture);
+			HRESULT hr = d3dDevice->CreateTexture2D(&desc, &initData, texture.put());
 			if (FAILED(hr)) {
 				SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 Texture2D 失败", hr));
 				return false;
@@ -388,14 +395,14 @@ bool CursorDrawer::_ResolveCursor(HCURSOR hCursor, _CursorInfo& result) const {
 
 	if(!result.hasInv) {
 		// 光标无反色部分，使用 WIC 将光标转换为带 Alpha 通道的图像
-		ComPtr<IWICImagingFactory2> wicFactory = App::GetInstance().GetWICImageFactory();
+		winrt::com_ptr<IWICImagingFactory2> wicFactory = App::GetInstance().GetWICImageFactory();
 		if (!wicFactory) {
 			SPDLOG_LOGGER_ERROR(logger, "获取 WICImageFactory 失败");
 			return false;
 		}
 
-		ComPtr<IWICBitmap> wicBitmap;
-		HRESULT hr = wicFactory->CreateBitmapFromHICON(hCursor, &wicBitmap);
+		winrt::com_ptr<IWICBitmap> wicBitmap;
+		HRESULT hr = wicFactory->CreateBitmapFromHICON(hCursor, wicBitmap.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("CreateBitmapFromHICON 失败", hr));
 			return false;
@@ -429,14 +436,14 @@ bool CursorDrawer::_ResolveCursor(HCURSOR hCursor, _CursorInfo& result) const {
 		initData.pSysMem = &pixels[0];
 		initData.SysMemPitch = result.width * 4;
 
-		hr = _d3dDevice->CreateTexture2D(&desc, &initData, &texture);
+		hr = d3dDevice->CreateTexture2D(&desc, &initData, texture.put());
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 Texture2D 失败", hr));
 			return false;
 		}
 	}
 
-	HRESULT hr = _d3dDevice->CreateShaderResourceView(texture.Get(), nullptr, &result.texture);
+	HRESULT hr = d3dDevice->CreateShaderResourceView(texture.get(), nullptr, result.texture.put());
 	if (FAILED(hr)) {
 		SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("创建 ShaderResourceView 失败", hr));
 		return false;
@@ -475,7 +482,7 @@ void CursorDrawer::_StartCapture(POINT cursorPt) {
 	}
 
 	// 移动光标位置
-	const RECT& srcFrameRect = App::GetInstance().GetSrcFrameRect();
+	const RECT& srcFrameRect = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 	const RECT& hostRect = App::GetInstance().GetHostWndRect();
 	// 跳过黑边
 	cursorPt.x = std::clamp(cursorPt.x, hostRect.left + _destRect.left, hostRect.left + _destRect.right - 1);
@@ -508,7 +515,7 @@ void CursorDrawer::_StopCapture(POINT cursorPt) {
 	//
 	// 在有黑边的情况下自动将光标调整到全屏窗口外
 
-	const RECT& srcFrameRect = App::GetInstance().GetSrcFrameRect();
+	const RECT& srcFrameRect = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 	const RECT& hostRect = App::GetInstance().GetHostWndRect();
 
 	POINT newCursorPt{};
@@ -570,7 +577,7 @@ void CursorDrawer::Draw() {
 		}
 	} else if (!App::GetInstance().IsBreakpointMode() && App::GetInstance().IsConfineCursorIn3DGames()) {
 		// 开启“在 3D 游戏中限制光标”则每帧都限制一次光标
-		ClipCursor(&App::GetInstance().GetSrcFrameRect());
+		ClipCursor(&App::GetInstance().GetFrameSource().GetSrcFrameRect());
 	}
 
 	CURSORINFO ci{};
@@ -606,7 +613,7 @@ void CursorDrawer::Draw() {
 	SIZE cursorSize = { lroundf(info->width * _zoomFactorX), lroundf(info->height * _zoomFactorY) };
 
 	// 映射坐标
-	const RECT& srcClient = App::GetInstance().GetSrcFrameRect();
+	const RECT& srcClient = App::GetInstance().GetFrameSource().GetSrcFrameRect();
 	POINT targetScreenPos = {
 		lroundf((ci.ptScreenPos.x - srcClient.left) * _clientScaleX - info->xHotSpot * _zoomFactorX),
 		lroundf((ci.ptScreenPos.y - srcClient.top) * _clientScaleY - info->yHotSpot * _zoomFactorY)
@@ -633,11 +640,13 @@ void CursorDrawer::Draw() {
 	float bottom = top - cursorSize.cy / FLOAT(_destRect.bottom - _destRect.top) * 2;
 
 	Renderer& renderer = App::GetInstance().GetRenderer();
-	renderer.SetSimpleVS(_vtxBuffer.Get());
-	_d3dDC->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	renderer.SetSimpleVS(_vtxBuffer.get());
+	auto d3dDC = App::GetInstance().GetDeviceResources().GetD3DDC();
+
+	d3dDC->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	
 	if (!info->hasInv) {
-		_d3dDC->OMSetRenderTargets(1, &_rtv, nullptr);
+		d3dDC->OMSetRenderTargets(1, &_rtv, nullptr);
 		D3D11_VIEWPORT vp{
 			(FLOAT)_destRect.left,
 			(FLOAT)_destRect.top,
@@ -646,10 +655,10 @@ void CursorDrawer::Draw() {
 			0.0f,
 			1.0f
 		};
-		_d3dDC->RSSetViewports(1, &vp);
+		d3dDC->RSSetViewports(1, &vp);
 
 		D3D11_MAPPED_SUBRESOURCE ms;
-		HRESULT hr = _d3dDC->Map(_vtxBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+		HRESULT hr = d3dDC->Map(_vtxBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("Map 失败", hr));
 			return;
@@ -661,11 +670,11 @@ void CursorDrawer::Draw() {
 		data[2] = { XMFLOAT3(left, bottom, 0.5f), XMFLOAT2(0.0f, 1.0f) };
 		data[3] = { XMFLOAT3(right, bottom, 0.5f), XMFLOAT2(1.0f, 1.0f) };
 
-		_d3dDC->Unmap(_vtxBuffer.Get(), 0);
+		d3dDC->Unmap(_vtxBuffer.get(), 0);
 
 		if (!renderer.SetCopyPS(
 			App::GetInstance().GetCursorInterpolationMode() == 0 ? _pointSam : _linearSam,
-			info->texture.Get())
+			info->texture.get())
 		) {
 			SPDLOG_LOGGER_ERROR(logger, "SetCopyPS 失败");
 			return;
@@ -674,7 +683,7 @@ void CursorDrawer::Draw() {
 			SPDLOG_LOGGER_ERROR(logger, "SetAlphaBlend 失败");
 			return;
 		}
-		_d3dDC->Draw(4, 0);
+		d3dDC->Draw(4, 0);
 
 		if (!renderer.SetAlphaBlend(false)) {
 			SPDLOG_LOGGER_ERROR(logger, "SetAlphaBlend 失败");
@@ -683,15 +692,15 @@ void CursorDrawer::Draw() {
 	} else {
 		// 绘制带有反色部分的光标，首先将光标覆盖的纹理复制到 _monoTmpTexture 中
 		// 不知为何 CopySubresourceRegion 会大幅增加 GPU 占用
-		_d3dDC->OMSetRenderTargets(1, &_monoTmpRtv, nullptr);
+		d3dDC->OMSetRenderTargets(1, &_monoTmpRtv, nullptr);
 		D3D11_VIEWPORT vp{};
 		vp.Width = (FLOAT)cursorSize.cx;
 		vp.Height = (FLOAT)cursorSize.cy;
 		vp.MaxDepth = 1.0f;
-		_d3dDC->RSSetViewports(1, &vp);
+		d3dDC->RSSetViewports(1, &vp);
 		
 		D3D11_MAPPED_SUBRESOURCE ms;
-		HRESULT hr = _d3dDC->Map(_vtxBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+		HRESULT hr = d3dDC->Map(_vtxBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("Map 失败", hr));
 			return;
@@ -707,16 +716,16 @@ void CursorDrawer::Draw() {
 		data[2] = { XMFLOAT3(-1, -1, 0.5f), XMFLOAT2(leftPos, bottomPos) };
 		data[3] = { XMFLOAT3(1, -1, 0.5f), XMFLOAT2(rightPos, bottomPos) };
 
-		_d3dDC->Unmap(_vtxBuffer.Get(), 0);
+		d3dDC->Unmap(_vtxBuffer.get(), 0);
 
 		if (!renderer.SetCopyPS(_pointSam, _renderTargetSrv)) {
 			SPDLOG_LOGGER_ERROR(logger, "SetCopyPS 失败");
 			return;
 		}
-		_d3dDC->Draw(4, 0);
+		d3dDC->Draw(4, 0);
 		
 		// 绘制光标
-		hr = _d3dDC->Map(_vtxBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+		hr = d3dDC->Map(_vtxBuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
 		if (FAILED(hr)) {
 			SPDLOG_LOGGER_ERROR(logger, MakeComErrorMsg("Map 失败", hr));
 			return;
@@ -728,22 +737,22 @@ void CursorDrawer::Draw() {
 		data[2] = { XMFLOAT3(left, bottom, 0.5f), XMFLOAT2(0.0f, 1.0f) };
 		data[3] = { XMFLOAT3(right, bottom, 0.5f), XMFLOAT2(1.0f, 1.0f) };
 
-		_d3dDC->Unmap(_vtxBuffer.Get(), 0);
+		d3dDC->Unmap(_vtxBuffer.get(), 0);
 
-		_d3dDC->PSSetShader(_monoCursorPS.Get(), nullptr, 0);
-		_d3dDC->PSSetConstantBuffers(0, 0, nullptr);
-		_d3dDC->OMSetRenderTargets(0, nullptr, nullptr);
-		ID3D11ShaderResourceView* srv[2] = { _monoTmpSrv, info->texture.Get() };
-		_d3dDC->PSSetShaderResources(0, 2, srv);
-		_d3dDC->PSSetSamplers(0, 1, App::GetInstance().GetCursorInterpolationMode() == 0 ? &_pointSam : &_linearSam);
+		d3dDC->PSSetShader(_monoCursorPS.get(), nullptr, 0);
+		d3dDC->PSSetConstantBuffers(0, 0, nullptr);
+		d3dDC->OMSetRenderTargets(0, nullptr, nullptr);
+		ID3D11ShaderResourceView* srv[2] = { _monoTmpSrv, info->texture.get() };
+		d3dDC->PSSetShaderResources(0, 2, srv);
+		d3dDC->PSSetSamplers(0, 1, App::GetInstance().GetCursorInterpolationMode() == 0 ? &_pointSam : &_linearSam);
 
-		_d3dDC->OMSetRenderTargets(1, &_rtv, nullptr);
+		d3dDC->OMSetRenderTargets(1, &_rtv, nullptr);
 		vp.TopLeftX = (FLOAT)_destRect.left;
 		vp.TopLeftY = (FLOAT)_destRect.top;
 		vp.Width = FLOAT(_destRect.right - _destRect.left);
 		vp.Height = FLOAT(_destRect.bottom - _destRect.top);
-		_d3dDC->RSSetViewports(1, &vp);
+		d3dDC->RSSetViewports(1, &vp);
 
-		_d3dDC->Draw(4, 0);
+		d3dDC->Draw(4, 0);
 	}
 }
